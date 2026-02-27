@@ -9,8 +9,8 @@ import { postJson, getJson } from "./http.js";
 import { readGitMeta } from "./git.js";
 import { saveProjectRegistration } from "./projects.js";
 
-const relayUrl = process.env.DURANGO_RELAY_URL ?? "http://localhost:8788";
-const webUrl = process.env.DURANGO_WEB_URL ?? "http://localhost:3000";
+const relayUrl = process.env.DURANGO_RELAY_URL ?? "https://relay-api.durango.sh";
+const webUrl = process.env.DURANGO_WEB_URL ?? "https://durango.sh";
 
 const ensureLoggedIn = async (): Promise<CliConfig> => {
   const existingConfig = await readConfig();
