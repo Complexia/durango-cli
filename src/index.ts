@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { spawnSync } from "node:child_process";
 import { Command } from "commander";
-import { clearConfig, configPath, readConfig, type CliConfig } from "./config.js";
+import { clearConfig, configPath, ensureMachineId, readConfig, type CliConfig } from "./config.js";
 import { runLogin } from "./login.js";
 import { DurangoBridge } from "./bridge.js";
 import { postJson, getJson } from "./http.js";
@@ -15,6 +15,7 @@ const webUrl = process.env.DURANGO_WEB_URL ?? "https://durango.sh";
 const ensureLoggedIn = async (): Promise<CliConfig> => {
   const existingConfig = await readConfig();
   if (existingConfig) {
+    await ensureMachineId(existingConfig.machineId);
     return existingConfig;
   }
 

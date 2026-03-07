@@ -16,6 +16,9 @@ durango init
 durango start
 ```
 
+- Run `durango init` inside any project you want linked.
+- Keep `durango` or `durango start` running anywhere on the machine; it will pick up newly initialized projects automatically without a restart.
+
 ## Local development
 
 ```bash

@@ -427,7 +427,17 @@ export class CodexAppServerClient extends EventEmitter {
       model: args.model ?? null,
       approvalPolicy: args.approvalPolicy ?? "never",
       sandbox: args.sandbox ?? "danger-full-access",
-      experimentalRawEvents: true
+      experimentalRawEvents: true,
+      persistExtendedHistory: true
+    });
+  }
+
+  async threadFork(args: {
+    codexThreadId: string;
+  }): Promise<{ thread: { id: string } }> {
+    return this.request("thread/fork", {
+      threadId: args.codexThreadId,
+      persistExtendedHistory: true
     });
   }
 

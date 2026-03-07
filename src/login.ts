@@ -1,9 +1,8 @@
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
 import os from "node:os";
 import open from "open";
 import { postJson } from "./http.js";
-import { writeConfig } from "./config.js";
+import { ensureMachineId, writeConfig } from "./config.js";
 
 type LoginOptions = {
   relayUrl: string;
@@ -229,7 +228,7 @@ const waitForCode = async (webUrl: string): Promise<string> => {
 };
 
 export const runLogin = async (opts: LoginOptions): Promise<void> => {
-  const machineId = randomUUID();
+  const machineId = await ensureMachineId();
   const code = await waitForCode(opts.webUrl);
 
   const exchange = await postJson<{

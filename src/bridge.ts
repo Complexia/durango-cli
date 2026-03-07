@@ -22,17 +22,38 @@ type PendingRun = {
 };
 
 type DispatchAttachment = NonNullable<Extract<DispatchAction, { type: "turn.start" }>["attachments"]>[number];
+const PROJECT_SYNC_INTERVAL_MS = 10_000;
+const RELAY_RECONNECT_BASE_DELAY_MS = 1_000;
+const RELAY_RECONNECT_MAX_DELAY_MS = 30_000;
+const RELAY_LIVENESS_MIN_INTERVAL_MS = 15_000;
+
+type ProjectSyncOutcome = {
+  attempted: number;
+  delivered: number;
+  updated: number;
+  failed: number;
+};
 
 export class DurangoBridge {
   private readonly codex = new CodexAppServerClient();
   private ws: WebSocket | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  private projectSyncTimer: NodeJS.Timeout | null = null;
+  private livenessTimer: NodeJS.Timeout | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private connectPromise: Promise<void> | null = null;
   private readonly pending = new Map<string, PendingRun>();
   private readonly threadBindings = new Map<string, string>();
+  private lastProjectSyncFingerprint: string | null = null;
+  private reconnectAttempt = 0;
+  private awaitingRelayPong = false;
+  private stopRequested = false;
+  private hasConnectedOnce = false;
 
   constructor(private readonly config: CliConfig) {}
 
   async start(): Promise<void> {
+    this.stopRequested = false;
     this.codex.on("stderr", (chunk: string) => {
       for (const rawLine of chunk.split(/\r?\n/)) {
         const text = rawLine.trim();
@@ -53,10 +74,10 @@ export class DurangoBridge {
       console.warn("Could not validate Codex auth status. Ensure `codex login` has been completed.");
     }
 
-    await this.connectRelay();
+    void this.ensureRelayConnection();
     await new Promise<void>((resolve) => {
-      process.on("SIGINT", () => resolve());
-      process.on("SIGTERM", () => resolve());
+      process.once("SIGINT", () => resolve());
+      process.once("SIGTERM", () => resolve());
     });
     await this.stop();
   }
@@ -71,19 +92,60 @@ export class DurangoBridge {
       .toLowerCase();
 
     return (
+      normalized.includes("codex app-server (websockets)") ||
+      normalized.includes("listening on: ws://") ||
+      normalized.includes("note: binds localhost only") ||
+      normalized.includes("websocket client connected from") ||
       normalized.includes("state db missing rollout path for thread") ||
       normalized.includes("find_thread_path_by_id_str_in_subdir") ||
       normalized.includes("state db record_discrepancy")
     );
   }
 
+  private async ensureRelayConnection(): Promise<void> {
+    if (this.stopRequested) {
+      return;
+    }
+
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    const connectPromise = this.connectRelay()
+      .catch((error) => {
+        if (this.stopRequested) {
+          return;
+        }
+
+        const message = error instanceof Error ? error.message : "unknown error";
+        this.scheduleReconnect(`Failed to connect to relay: ${message}`);
+      })
+      .finally(() => {
+        if (this.connectPromise === connectPromise) {
+          this.connectPromise = null;
+        }
+      });
+
+    this.connectPromise = connectPromise;
+    return connectPromise;
+  }
+
   private async connectRelay(): Promise<void> {
     const wsUrl = relayWsUrl(this.config.relayUrl);
-    this.ws = new WebSocket(wsUrl, {
+    const socket = new WebSocket(wsUrl, {
       perMessageDeflate: false
     });
+    this.ws = socket;
 
-    this.ws.on("open", () => {
+    socket.on("open", () => {
+      if (this.ws !== socket || this.stopRequested) {
+        return;
+      }
+
       const hello: RelayClientMessage = {
         type: "machine.hello",
         token: this.config.token,
@@ -99,17 +161,34 @@ export class DurangoBridge {
         }
       };
 
-      this.ws?.send(JSON.stringify(hello));
+      socket.send(JSON.stringify(hello));
     });
 
-    this.ws.on("message", async (data) => {
+    socket.on("pong", () => {
+      if (this.ws !== socket) {
+        return;
+      }
+
+      this.awaitingRelayPong = false;
+    });
+
+    socket.on("message", async (data) => {
+      if (this.ws !== socket) {
+        return;
+      }
+
       const message = JSON.parse(data.toString()) as RelayServerMessage;
 
       if (message.type === "session.ready") {
-        console.log(`Connected to relay as machine ${message.machineId}`);
+        this.reconnectAttempt = 0;
+        this.clearReconnectTimer();
+        this.awaitingRelayPong = false;
+        console.log("Connected.");
+        this.hasConnectedOnce = true;
         this.startHeartbeat(message.heartbeatIntervalMs);
-        const projects = await this.syncProjects();
-        await this.syncThreads(projects);
+        this.startRelayLivenessProbe(message.heartbeatIntervalMs);
+        await this.syncProjectsAndThreads({ force: true });
+        this.startProjectSyncLoop();
         return;
       }
 
@@ -119,6 +198,7 @@ export class DurangoBridge {
           await this.stop();
           process.exit(1);
         }
+        socket.close();
         return;
       }
 
@@ -127,22 +207,83 @@ export class DurangoBridge {
       }
     });
 
-    this.ws.on("close", () => {
-      console.log("Disconnected from relay.");
-      if (this.heartbeatTimer) {
-        clearInterval(this.heartbeatTimer);
-        this.heartbeatTimer = null;
+    socket.on("close", () => {
+      if (this.ws !== socket) {
+        return;
+      }
+
+      this.ws = null;
+      this.clearRelayLoopTimers();
+
+      if (!this.stopRequested) {
+        this.scheduleReconnect("Disconnected from relay");
       }
     });
 
-    this.ws.on("error", (error) => {
+    socket.on("error", (error) => {
+      if (this.ws !== socket) {
+        return;
+      }
+
       console.error("Relay websocket error", error);
     });
 
     await new Promise<void>((resolve, reject) => {
-      this.ws?.once("open", () => resolve());
-      this.ws?.once("error", (err) => reject(err));
+      socket.once("open", () => resolve());
+      socket.once("error", (err) => reject(err));
     });
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private clearRelayLoopTimers(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+
+    if (this.projectSyncTimer) {
+      clearInterval(this.projectSyncTimer);
+      this.projectSyncTimer = null;
+    }
+
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = null;
+    }
+
+    this.awaitingRelayPong = false;
+  }
+
+  private nextReconnectDelayMs(): number {
+    const delayMs = Math.min(
+      RELAY_RECONNECT_MAX_DELAY_MS,
+      RELAY_RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempt
+    );
+    this.reconnectAttempt += 1;
+    return delayMs;
+  }
+
+  private formatReconnectDelay(delayMs: number): string {
+    return delayMs >= 1_000 ? `${Math.round(delayMs / 1_000)}s` : `${delayMs}ms`;
+  }
+
+  private scheduleReconnect(reason: string): void {
+    if (this.stopRequested || this.reconnectTimer) {
+      return;
+    }
+
+    const delayMs = this.nextReconnectDelayMs();
+    console.warn(`${reason}. Retrying in ${this.formatReconnectDelay(delayMs)}.`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.ensureRelayConnection();
+    }, delayMs);
   }
 
   private send(message: RelayClientMessage): void {
@@ -167,29 +308,103 @@ export class DurangoBridge {
     }, intervalMs);
   }
 
-  private async syncProjects(): Promise<ProjectRegistration[]> {
+  private startRelayLivenessProbe(intervalMs: number): void {
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+    }
+
+    this.awaitingRelayPong = false;
+    this.livenessTimer = setInterval(() => {
+      const socket = this.ws;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      if (this.awaitingRelayPong) {
+        console.warn("Relay websocket became unresponsive. Reconnecting.");
+        socket.terminate();
+        return;
+      }
+
+      this.awaitingRelayPong = true;
+      try {
+        socket.ping();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "unknown error";
+        console.error(`Failed to ping relay websocket: ${message}`);
+        this.awaitingRelayPong = false;
+        socket.terminate();
+      }
+    }, Math.max(RELAY_LIVENESS_MIN_INTERVAL_MS, intervalMs));
+  }
+
+  private startProjectSyncLoop(): void {
+    if (this.projectSyncTimer) {
+      clearInterval(this.projectSyncTimer);
+    }
+
+    this.projectSyncTimer = setInterval(() => {
+      void this.syncProjectsAndThreads().catch((error) => {
+        const message = error instanceof Error ? error.message : "unknown error";
+        console.error(`Failed to refresh local Durango projects: ${message}`);
+      });
+    }, PROJECT_SYNC_INTERVAL_MS);
+  }
+
+  private buildProjectSyncFingerprint(projects: ProjectRegistration[]): string {
+    return [...projects]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((project) =>
+        [
+          project.id,
+          project.machineId,
+          this.normalizePath(project.absolutePath),
+          project.name,
+          project.gitBranch ?? "",
+          project.gitRemoteUrl ?? ""
+        ].join("|")
+      )
+      .join("\n");
+  }
+
+  private async syncProjectsAndThreads(options?: { force?: boolean }): Promise<ProjectRegistration[]> {
     const projects = await loadProjectsForMachine(this.config.machineId);
+    const nextFingerprint = this.buildProjectSyncFingerprint(projects);
+    if (!options?.force && nextFingerprint === this.lastProjectSyncFingerprint) {
+      return projects;
+    }
+
+    const syncedProjects = await this.syncProjects(projects);
+    await this.syncThreads(syncedProjects);
+    this.lastProjectSyncFingerprint = nextFingerprint;
+    return syncedProjects;
+  }
+
+  private async syncProjects(projects: ProjectRegistration[]): Promise<ProjectRegistration[]> {
     if (projects.length === 0) {
       return [];
     }
 
     const endpoint = `${this.config.relayUrl.replace(/\/$/, "")}/v1/projects/register`;
-    let synced = 0;
+    const outcome: ProjectSyncOutcome = {
+      attempted: projects.length,
+      delivered: 0,
+      updated: 0,
+      failed: 0
+    };
 
     for (const project of projects) {
       try {
         const result = await postJson<{ ok: boolean }>(endpoint, { project }, this.config.token);
+        outcome.delivered += 1;
         if (result.ok) {
-          synced += 1;
+          outcome.updated += 1;
         }
       } catch (error) {
+        outcome.failed += 1;
         const message = error instanceof Error ? error.message : "unknown error";
         console.error(`Failed to sync project ${project.absolutePath}: ${message}`);
       }
-    }
-
-    if (synced > 0) {
-      console.log(`Synced ${synced} local project${synced === 1 ? "" : "s"} with relay.`);
     }
 
     return projects;
@@ -305,9 +520,6 @@ export class DurangoBridge {
       synced += 1;
     }
 
-    if (synced > 0) {
-      console.log(`Synced ${synced} saved thread${synced === 1 ? "" : "s"} from codex app-server.`);
-    }
   }
 
   private async ack(action: DispatchAction, status: "accepted" | "running" | "completed" | "failed", payload?: Record<string, unknown>, error?: { code: string; message: string }): Promise<void> {
@@ -440,6 +652,22 @@ export class DurangoBridge {
         this.threadBindings.set(action.codexThreadId, action.threadId);
         const importedItemCount = await this.hydrateThreadHistory(action.threadId, action.codexThreadId);
         await this.ack(action, "completed", { state: "hydrated", importedItemCount });
+        return;
+      }
+
+      if (action.type === "thread.fork") {
+        await this.ack(action, "running");
+        const forked = await this.codex.threadFork({
+          codexThreadId: action.codexThreadId
+        });
+
+        this.threadBindings.set(forked.thread.id, action.threadId);
+
+        await this.ack(action, "completed", {
+          state: "forked",
+          threadId: action.requestId,
+          codexThreadId: forked.thread.id
+        });
         return;
       }
 
@@ -1133,15 +1361,19 @@ export class DurangoBridge {
   }
 
   async stop(): Promise<void> {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
+    this.stopRequested = true;
+    this.clearReconnectTimer();
+    this.clearRelayLoopTimers();
 
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.close();
-    }
+    const socket = this.ws;
     this.ws = null;
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      if (socket.readyState === WebSocket.CONNECTING) {
+        socket.terminate();
+      } else {
+        socket.close();
+      }
+    }
 
     await this.codex.stop();
   }

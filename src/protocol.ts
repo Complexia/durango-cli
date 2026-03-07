@@ -137,6 +137,14 @@ export type DispatchAction =
       prompt: string;
     }
   | {
+      type: "thread.fork";
+      requestId: string;
+      userId: string;
+      machineId: string;
+      threadId: string;
+      codexThreadId: string;
+    }
+  | {
       type: "thread.hydrate";
       requestId: string;
       userId: string;
