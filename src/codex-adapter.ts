@@ -342,7 +342,7 @@ export class CodexAppServerClient extends EventEmitter {
     await this.request("initialize", {
       clientInfo: {
         name: "durango-cli",
-        version: "0.1.2"
+        version: "0.1.3"
       },
       capabilities: {
         experimentalApi: true

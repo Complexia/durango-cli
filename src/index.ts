@@ -93,7 +93,7 @@ export const createProgram = (): Command => {
   program
     .name("durango")
     .description("Control local Codex agents from Durango web")
-    .version("0.1.2");
+    .version("0.1.3");
 
   program
     .command("login")

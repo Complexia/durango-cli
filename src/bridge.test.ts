@@ -348,6 +348,100 @@ describe("DurangoBridge history hydration parsing", () => {
     });
   });
 
+  it("uses the dispatch request id for live turn events until completion", () => {
+    const send = vi.fn();
+    const bridge = new DurangoBridge(testConfig) as unknown as {
+      forwardCodexNotification: (method: string, params: unknown) => void;
+      send: typeof send;
+      threadBindings: Map<string, string>;
+      activeDispatchRequestIds: Map<string, string>;
+      activeTurnIds: Map<string, string>;
+    };
+
+    bridge.send = send;
+    bridge.threadBindings.set("thr_live", "codex:thr_live");
+    bridge.activeDispatchRequestIds.set("thr_live", "dispatch_live");
+    bridge.activeTurnIds.set("thr_live", "turn_live");
+
+    bridge.forwardCodexNotification("turn/completed", {
+      threadId: "thr_live",
+      turnId: "turn_live",
+      status: "completed"
+    });
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "event.upsert",
+        requestId: "dispatch_live",
+        threadId: "codex:thr_live"
+      })
+    );
+  });
+
+  it("merges assistant deltas into a live streamed message", () => {
+    const send = vi.fn();
+    const bridge = new DurangoBridge(testConfig) as unknown as {
+      forwardCodexNotification: (method: string, params: unknown) => void;
+      send: typeof send;
+      threadBindings: Map<string, string>;
+      activeDispatchRequestIds: Map<string, string>;
+    };
+
+    bridge.send = send;
+    bridge.threadBindings.set("thr_delta", "codex:thr_delta");
+    bridge.activeDispatchRequestIds.set("thr_delta", "dispatch_delta");
+
+    bridge.forwardCodexNotification("item/delta", {
+      threadId: "thr_delta",
+      turnId: "turn_delta",
+      item: {
+        id: "assistant-delta",
+        type: "assistant_message",
+        content: {
+          delta: "Hel"
+        }
+      }
+    });
+    bridge.forwardCodexNotification("item/delta", {
+      threadId: "thr_delta",
+      turnId: "turn_delta",
+      item: {
+        id: "assistant-delta",
+        type: "assistant_message",
+        content: {
+          delta: "lo"
+        }
+      }
+    });
+
+    expect(send).toHaveBeenNthCalledWith(1, {
+      type: "event.upsert",
+      requestId: "dispatch_delta",
+      machineId: testConfig.machineId,
+      threadId: "codex:thr_delta",
+      item: {
+        type: "agentMessage",
+        id: "assistant-delta",
+        turnId: "turn_delta",
+        text: "Hel",
+        timestamp: expect.any(Number)
+      }
+    });
+    expect(send).toHaveBeenNthCalledWith(2, {
+      type: "event.upsert",
+      requestId: "dispatch_delta",
+      machineId: testConfig.machineId,
+      threadId: "codex:thr_delta",
+      item: {
+        type: "agentMessage",
+        id: "assistant-delta",
+        turnId: "turn_delta",
+        text: "Hello",
+        timestamp: expect.any(Number)
+      }
+    });
+  });
+
   it("resolves pending turn-start ack from the first streamed notification", async () => {
     const bridge = new DurangoBridge(testConfig) as unknown as {
       ack: ReturnType<typeof vi.fn>;

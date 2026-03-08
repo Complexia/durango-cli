@@ -55,7 +55,9 @@ export class DurangoBridge {
   private readonly threadBindings = new Map<string, string>();
   private readonly reviewThreadIds = new Set<string>();
   private readonly activeTurnIds = new Map<string, string>();
+  private readonly activeDispatchRequestIds = new Map<string, string>();
   private readonly pendingTurnStartAcks = new Map<string, PendingTurnStartAck>();
+  private readonly liveItemSnapshots = new Map<string, DurangoThreadItem>();
   private lastProjectSyncFingerprint: string | null = null;
   private reconnectAttempt = 0;
   private awaitingRelayPong = false;
@@ -168,7 +170,7 @@ export class DurangoBridge {
           platform: os.platform(),
           arch: os.arch(),
           osVersion: os.release(),
-          cliVersion: "0.1.2",
+          cliVersion: "0.1.3",
           codexVersion: process.env.CODEX_VERSION ?? "unknown"
         }
       };
@@ -653,6 +655,7 @@ export class DurangoBridge {
         const hasInitialTurn = Boolean(action.prompt?.trim()) || Boolean(action.attachments?.length);
         let startedTurnId: string | undefined;
         if (hasInitialTurn) {
+          this.activeDispatchRequestIds.set(thread.thread.id, action.requestId);
           this.pendingTurnStartAcks.set(thread.thread.id, {
             action,
             codexThreadId: thread.thread.id,
@@ -726,6 +729,7 @@ export class DurangoBridge {
       if (action.type === "turn.start") {
         await this.ack(action, "running");
         this.threadBindings.set(action.codexThreadId, action.threadId);
+        this.activeDispatchRequestIds.set(action.codexThreadId, action.requestId);
         this.pendingTurnStartAcks.set(action.codexThreadId, {
           action,
           codexThreadId: action.codexThreadId,
@@ -810,6 +814,7 @@ export class DurangoBridge {
             : action.codexThreadId;
         if (codexThreadId) {
           this.pendingTurnStartAcks.delete(codexThreadId);
+          this.activeDispatchRequestIds.delete(codexThreadId);
         }
       }
       await this.ack(action, "failed", undefined, {
@@ -1177,9 +1182,13 @@ export class DurangoBridge {
       void this.completePendingTurnStartAck(codexThreadId, extractedTurnId);
     }
     const envelope = this.asObject(params);
-    const rawItem = this.asObject(envelope?.item);
+    const rawEnvelopeItem = this.asObject(envelope?.item);
+    const rawItem =
+      rawEnvelopeItem ??
+      (envelope && typeof envelope.type === "string" ? envelope : null);
     const rawReviewOutput = envelope?.review_output ?? envelope?.reviewOutput;
     const isReviewThread = this.reviewThreadIds.has(codexThreadId);
+    const liveRequestId = this.resolveLiveRequestId(codexThreadId, turnId);
 
     let items: DurangoThreadItem[] = [];
 
@@ -1195,9 +1204,19 @@ export class DurangoBridge {
       } else {
         return;
       }
+    } else if (lowerMethod.includes("delta")) {
+      if (!rawItem) {
+        return;
+      }
+
+      items = this
+        .mapCodexItem(rawItem, turnId, Date.now(), { allowReviewItems: isReviewThread })
+        .map((item) => this.mergeLiveItemSnapshot(durangoThreadId, item, "delta"));
     } else if (lowerMethod === "item/completed") {
       if (rawItem) {
-        items = this.mapCodexItem(rawItem, turnId, Date.now(), { allowReviewItems: isReviewThread });
+        items = this
+          .mapCodexItem(rawItem, turnId, Date.now(), { allowReviewItems: isReviewThread })
+          .map((item) => this.mergeLiveItemSnapshot(durangoThreadId, item, "replace"));
       } else if (isReviewThread) {
         const structuredReview = this.mapReviewResult({
           id: `review:${turnId}`,
@@ -1242,15 +1261,22 @@ export class DurangoBridge {
     } else if (
       lowerMethod === "thread/started" ||
       lowerMethod === "turn/started" ||
-      lowerMethod.includes("delta") ||
       lowerMethod.includes("updated")
     ) {
-      return;
+      if (!lowerMethod.includes("updated") || !rawItem) {
+        return;
+      }
+
+      items = this
+        .mapCodexItem(rawItem, turnId, Date.now(), { allowReviewItems: isReviewThread })
+        .map((item) => this.mergeLiveItemSnapshot(durangoThreadId, item, "replace"));
     }
 
     if (lowerMethod === "turn/completed") {
       this.activeTurnIds.delete(codexThreadId);
+      this.activeDispatchRequestIds.delete(codexThreadId);
       this.pendingTurnStartAcks.delete(codexThreadId);
+      this.clearLiveSnapshotsForTurn(turnId);
     }
 
     if (items.length === 0) {
@@ -1268,11 +1294,15 @@ export class DurangoBridge {
     for (const item of items) {
       this.send({
         type: "event.upsert",
-        requestId: turnId,
+        requestId: liveRequestId,
         machineId: this.config.machineId,
         threadId: durangoThreadId,
         item
       });
+
+      if (lowerMethod === "item/completed") {
+        this.liveItemSnapshots.delete(this.liveItemSnapshotKey(durangoThreadId, item.id));
+      }
     }
   }
 
@@ -1491,6 +1521,91 @@ export class DurangoBridge {
     }
 
     return !normalized.startsWith("auto-compact-");
+  }
+
+  private liveItemSnapshotKey(threadId: string, itemId: string): string {
+    return `${threadId}:${itemId}`;
+  }
+
+  private resolveLiveRequestId(codexThreadId: string, turnId: string): string {
+    return this.activeDispatchRequestIds.get(codexThreadId) ?? turnId;
+  }
+
+  private mergeLiveItemSnapshot(
+    threadId: string,
+    item: DurangoThreadItem,
+    mode: "delta" | "replace"
+  ): DurangoThreadItem {
+    const snapshotKey = this.liveItemSnapshotKey(threadId, item.id);
+    const previous = this.liveItemSnapshots.get(snapshotKey);
+
+    if (!previous || mode === "replace" || previous.type !== item.type) {
+      this.liveItemSnapshots.set(snapshotKey, item);
+      return item;
+    }
+
+    if (item.type === "agentMessage") {
+      if (previous.type !== "agentMessage") {
+        this.liveItemSnapshots.set(snapshotKey, item);
+        return item;
+      }
+      const text =
+        item.text.startsWith(previous.text) || previous.text.includes(item.text)
+          ? item.text.length >= previous.text.length
+            ? item.text
+            : previous.text
+          : `${previous.text}${item.text}`;
+      const next: DurangoThreadItem = { ...item, text };
+      this.liveItemSnapshots.set(snapshotKey, next);
+      return next;
+    }
+
+    if (item.type === "reasoning") {
+      if (previous.type !== "reasoning") {
+        this.liveItemSnapshots.set(snapshotKey, item);
+        return item;
+      }
+      const summary = [...previous.summary];
+      for (const line of item.summary) {
+        if (line && summary[summary.length - 1] !== line) {
+          summary.push(line);
+        }
+      }
+      const next: DurangoThreadItem = { ...item, summary };
+      this.liveItemSnapshots.set(snapshotKey, next);
+      return next;
+    }
+
+    if (item.type === "commandExecution") {
+      if (previous.type !== "commandExecution") {
+        this.liveItemSnapshots.set(snapshotKey, item);
+        return item;
+      }
+      const previousOutput = previous.output ?? "";
+      const nextOutput = item.output ?? "";
+      const output =
+        nextOutput.length === 0
+          ? previousOutput
+          : nextOutput.startsWith(previousOutput) || previousOutput.includes(nextOutput)
+            ? nextOutput.length >= previousOutput.length
+              ? nextOutput
+              : previousOutput
+            : `${previousOutput}${nextOutput}`;
+      const next: DurangoThreadItem = { ...item, output: output || undefined };
+      this.liveItemSnapshots.set(snapshotKey, next);
+      return next;
+    }
+
+    this.liveItemSnapshots.set(snapshotKey, item);
+    return item;
+  }
+
+  private clearLiveSnapshotsForTurn(turnId: string): void {
+    for (const [key, snapshot] of this.liveItemSnapshots.entries()) {
+      if (snapshot.turnId === turnId) {
+        this.liveItemSnapshots.delete(key);
+      }
+    }
   }
 
   private mapCodexItem(
