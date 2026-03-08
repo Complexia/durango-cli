@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { clearConfig, configPath, ensureMachineId, readConfig, type CliConfig } from "./config.js";
 import { runLogin } from "./login.js";
@@ -12,6 +13,15 @@ import { saveProjectRegistration } from "./projects.js";
 const relayUrl = process.env.DURANGO_RELAY_URL ?? "https://relay-api.durango.sh";
 const webUrl = process.env.DURANGO_WEB_URL ?? "https://durango.sh";
 
+const requireConfig = async (message: string): Promise<CliConfig> => {
+  const config = await readConfig();
+  if (!config) {
+    throw new Error(message);
+  }
+
+  return config;
+};
+
 const ensureLoggedIn = async (): Promise<CliConfig> => {
   const existingConfig = await readConfig();
   if (existingConfig) {
@@ -22,12 +32,101 @@ const ensureLoggedIn = async (): Promise<CliConfig> => {
   console.log(`No login session found. Starting browser auth flow (config: ${configPath})...`);
   await runLogin({ relayUrl, webUrl });
 
-  const refreshedConfig = await readConfig();
-  if (!refreshedConfig) {
-    throw new Error(`Login completed but config file was not written (${configPath}).`);
-  }
+  return requireConfig(`Login completed but config file was not written (${configPath}).`);
+};
 
-  return refreshedConfig;
+const startBridgeSession = async (config: CliConfig): Promise<void> => {
+  const bridge = new DurangoBridge(config);
+  await bridge.start();
+};
+
+const loginAndConnect = async (): Promise<void> => {
+  await runLogin({ relayUrl, webUrl });
+  const config = await requireConfig(`Login completed but config file was not written (${configPath}).`);
+  await startBridgeSession(config);
+};
+
+export const createProgram = (): Command => {
+  const program = new Command();
+  program
+    .name("durango")
+    .description("Control local Codex agents from Durango web")
+    .version("0.1.0");
+
+  program
+    .command("login")
+    .description("Link this machine to your Durango account and start the local bridge")
+    .action(async () => {
+      await loginAndConnect();
+    });
+
+  program
+    .command("init")
+    .description("Register current folder as a Durango project")
+    .action(async () => {
+      const config = await ensureLoggedIn();
+
+      const cwd = process.cwd();
+      const git = await readGitMeta(cwd);
+      const project = await saveProjectRegistration({
+        absolutePath: cwd,
+        machineId: config.machineId,
+        gitBranch: git.branch,
+        gitRemoteUrl: git.remoteUrl
+      });
+
+      const result = await postJson<{ ok: boolean }>(
+        `${config.relayUrl.replace(/\/$/, "")}/v1/projects/register`,
+        { project },
+        config.token
+      );
+
+      if (result.ok) {
+        console.log(`Registered project ${project.name} (${project.absolutePath})`);
+      }
+    });
+
+  program
+    .command("status")
+    .description("Show relay connectivity and auth status")
+    .action(async () => {
+      const config = await readConfig();
+      if (!config) {
+        console.log("Not logged in.");
+        return;
+      }
+
+      const status = await getJson<{ machineId: string; userId: string; online: boolean; lastHeartbeatAt: number | null }>(
+        `${config.relayUrl.replace(/\/$/, "")}/v1/machines/me/status`,
+        config.token
+      );
+
+      console.log(JSON.stringify({ ...status, configPath }, null, 2));
+    });
+
+  program
+    .command("logout")
+    .description("Remove local auth token")
+    .action(async () => {
+      await clearConfig();
+      console.log("Durango config cleared.");
+    });
+
+  program
+    .command("start")
+    .description("Start Durango local bridge session")
+    .action(async () => {
+      const config = await ensureLoggedIn();
+      await startBridgeSession(config);
+    });
+
+  program
+    .action(async () => {
+      const config = await ensureLoggedIn();
+      await startBridgeSession(config);
+    });
+
+  return program;
 };
 
 if (process.versions.bun && process.env.DURANGO_NODE_RELAUNCHED !== "1") {
@@ -50,90 +149,16 @@ if (process.versions.bun && process.env.DURANGO_NODE_RELAUNCHED !== "1") {
   process.exit(relaunched.status ?? 0);
 }
 
-const program = new Command();
-program
-  .name("durango")
-  .description("Control local Codex agents from Durango web")
-  .version("0.1.0");
+export const main = async (argv: string[] = process.argv): Promise<void> => {
+  const program = createProgram();
+  await program.parseAsync(argv);
+};
 
-program
-  .command("login")
-  .description("Link this machine to your Durango account")
-  .action(async () => {
-    await runLogin({ relayUrl, webUrl });
+const isDirectRun = process.argv[1] ? pathToFileURL(process.argv[1]).href === import.meta.url : false;
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
   });
-
-program
-  .command("init")
-  .description("Register current folder as a Durango project")
-  .action(async () => {
-    const config = await ensureLoggedIn();
-
-    const cwd = process.cwd();
-    const git = await readGitMeta(cwd);
-    const project = await saveProjectRegistration({
-      absolutePath: cwd,
-      machineId: config.machineId,
-      gitBranch: git.branch,
-      gitRemoteUrl: git.remoteUrl
-    });
-
-    const result = await postJson<{ ok: boolean }>(
-      `${config.relayUrl.replace(/\/$/, "")}/v1/projects/register`,
-      { project },
-      config.token
-    );
-
-    if (result.ok) {
-      console.log(`Registered project ${project.name} (${project.absolutePath})`);
-    }
-  });
-
-program
-  .command("status")
-  .description("Show relay connectivity and auth status")
-  .action(async () => {
-    const config = await readConfig();
-    if (!config) {
-      console.log("Not logged in.");
-      return;
-    }
-
-    const status = await getJson<{ machineId: string; userId: string; online: boolean; lastHeartbeatAt: number | null }>(
-      `${config.relayUrl.replace(/\/$/, "")}/v1/machines/me/status`,
-      config.token
-    );
-
-    console.log(JSON.stringify({ ...status, configPath }, null, 2));
-  });
-
-program
-  .command("logout")
-  .description("Remove local auth token")
-  .action(async () => {
-    await clearConfig();
-    console.log("Durango config cleared.");
-  });
-
-program
-  .command("start")
-  .description("Start Durango local bridge session")
-  .action(async () => {
-    const config = await ensureLoggedIn();
-
-    const bridge = new DurangoBridge(config);
-    await bridge.start();
-  });
-
-program
-  .action(async () => {
-    const config = await ensureLoggedIn();
-
-    const bridge = new DurangoBridge(config);
-    await bridge.start();
-  });
-
-program.parseAsync(process.argv).catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+}

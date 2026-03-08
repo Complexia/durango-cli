@@ -497,7 +497,8 @@ export class DurangoBridge {
         continue;
       }
 
-      const durangoThreadId = this.makeDurangoThreadId(codexThreadId);
+      const durangoThreadId =
+        this.threadBindings.get(codexThreadId) ?? this.makeDurangoThreadId(codexThreadId);
       this.threadBindings.set(codexThreadId, durangoThreadId);
       const createdAt = this.normalizeTimestamp(this.getNumber(appThread.createdAt) ?? undefined);
       const updatedAt = this.normalizeTimestamp(
@@ -661,11 +662,11 @@ export class DurangoBridge {
           codexThreadId: action.codexThreadId
         });
 
-        this.threadBindings.set(forked.thread.id, action.threadId);
+        this.threadBindings.set(forked.thread.id, action.childThreadId);
 
         await this.ack(action, "completed", {
           state: "forked",
-          threadId: action.requestId,
+          threadId: action.childThreadId,
           codexThreadId: forked.thread.id
         });
         return;

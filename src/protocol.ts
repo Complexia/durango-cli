@@ -143,6 +143,7 @@ export type DispatchAction =
       machineId: string;
       threadId: string;
       codexThreadId: string;
+      childThreadId: string;
     }
   | {
       type: "thread.hydrate";
