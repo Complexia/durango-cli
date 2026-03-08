@@ -99,6 +99,45 @@ type ModelListPage = {
   nextCursor?: string | null;
 };
 
+export type CodexCollaborationMode = {
+  mode: "default" | "plan";
+  settings: {
+    model: string;
+    reasoningEffort?: CodexReasoningEffort | null;
+  };
+};
+
+export type CodexCollaborationModeMask = {
+  name: string;
+  mode?: "default" | "plan" | null;
+  model?: string | null;
+  reasoning_effort?: CodexReasoningEffort | null;
+  developer_instructions?: string | null;
+};
+
+type CollaborationModeListResponse = {
+  data?: CodexCollaborationModeMask[];
+};
+
+export type CodexReviewFinding = {
+  title: string;
+  body: string;
+  code_location: {
+    absolute_file_path: string;
+    line_range: {
+      start: number;
+      end: number;
+    };
+  };
+  confidence_score: number;
+  priority: number;
+};
+
+export type CodexReviewStartResponse = {
+  turn: { id: string; status?: string };
+  reviewThreadId: string;
+};
+
 export class CodexAppServerClient extends EventEmitter {
   private ws: WebSocket | null = null;
   private proc: ChildProcess | null = null;
@@ -303,7 +342,7 @@ export class CodexAppServerClient extends EventEmitter {
     await this.request("initialize", {
       clientInfo: {
         name: "durango-cli",
-        version: "0.1.0"
+        version: "0.1.2"
       },
       capabilities: {
         experimentalApi: true
@@ -416,6 +455,11 @@ export class CodexAppServerClient extends EventEmitter {
     return models;
   }
 
+  async listCollaborationModes(): Promise<CodexCollaborationModeMask[]> {
+    const response = await this.request<CollaborationModeListResponse>("collaborationMode/list", {});
+    return Array.isArray(response.data) ? response.data : [];
+  }
+
   async threadStart(args: {
     cwd: string;
     model?: string;
@@ -457,6 +501,7 @@ export class CodexAppServerClient extends EventEmitter {
     input?: CodexTurnInputItem[];
     model?: string;
     reasoningEffort?: CodexReasoningEffort;
+    collaborationMode?: CodexCollaborationMode;
     approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
     sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   }): Promise<{ turn: { id: string } }> {
@@ -517,8 +562,38 @@ export class CodexAppServerClient extends EventEmitter {
       }),
       model: args.model ?? null,
       effort: args.reasoningEffort ?? null,
+      collaborationMode: args.collaborationMode
+        ? {
+            mode: args.collaborationMode.mode,
+            settings: {
+              model: args.collaborationMode.settings.model,
+              reasoning_effort: args.collaborationMode.settings.reasoningEffort ?? null,
+              developer_instructions: null
+            }
+          }
+        : null,
       approvalPolicy: args.approvalPolicy ?? null,
       sandboxPolicy: args.sandbox ? { mode: args.sandbox } : null
+    });
+  }
+
+  async reviewStart(args: {
+    codexThreadId: string;
+    target:
+      | { type: "uncommittedChanges" }
+      | {
+          type: "baseBranch";
+          branch: string;
+        };
+    delivery?: "inline" | "detached";
+  }): Promise<CodexReviewStartResponse> {
+    return this.request("review/start", {
+      threadId: args.codexThreadId,
+      target:
+        args.target.type === "uncommittedChanges"
+          ? { type: "uncommittedChanges" }
+          : { type: "baseBranch", branch: args.target.branch },
+      delivery: args.delivery ?? null
     });
   }
 

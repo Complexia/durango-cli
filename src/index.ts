@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { clearConfig, configPath, ensureMachineId, readConfig, type CliConfig } from "./config.js";
 import { runLogin } from "./login.js";
@@ -10,27 +12,66 @@ import { postJson, getJson } from "./http.js";
 import { readGitMeta } from "./git.js";
 import { saveProjectRegistration } from "./projects.js";
 
-const relayUrl = process.env.DURANGO_RELAY_URL ?? "https://relay-api.durango.sh";
-const webUrl = process.env.DURANGO_WEB_URL ?? "https://durango.sh";
+const LOCAL_DEFAULTS = {
+  relayUrl: "http://localhost:8788",
+  webUrl: "http://localhost:3000"
+} as const;
+
+const PRODUCTION_DEFAULTS = {
+  relayUrl: "https://relay-api.durango.sh",
+  webUrl: "https://durango.sh"
+} as const;
+
+export const isSourceCheckout = (): boolean => {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  return existsSync(path.join(moduleDir, "../src/index.ts"));
+};
+
+export const resolveDurangoUrls = (): { relayUrl: string; webUrl: string } => {
+  const defaults = isSourceCheckout() ? LOCAL_DEFAULTS : PRODUCTION_DEFAULTS;
+  return {
+    relayUrl: process.env.DURANGO_RELAY_URL ?? defaults.relayUrl,
+    webUrl: process.env.DURANGO_WEB_URL ?? defaults.webUrl
+  };
+};
+
+const applyRuntimeUrls = (
+  config: CliConfig,
+  urls: { relayUrl: string; webUrl: string }
+): CliConfig => ({
+  ...config,
+  relayUrl: urls.relayUrl,
+  webUrl: urls.webUrl
+});
 
 const requireConfig = async (message: string): Promise<CliConfig> => {
+  const urls = resolveDurangoUrls();
   const config = await readConfig();
   if (!config) {
     throw new Error(message);
   }
 
-  return config;
+  return applyRuntimeUrls(config, urls);
 };
 
 const ensureLoggedIn = async (): Promise<CliConfig> => {
+  const urls = resolveDurangoUrls();
   const existingConfig = await readConfig();
   if (existingConfig) {
     await ensureMachineId(existingConfig.machineId);
-    return existingConfig;
+    if (existingConfig.relayUrl === urls.relayUrl) {
+      return applyRuntimeUrls(existingConfig, urls);
+    }
+
+    console.log(
+      `Stored Durango session targets ${existingConfig.relayUrl}, but this run targets ${urls.relayUrl}. Starting browser auth flow for the current relay...`
+    );
+    await runLogin(urls);
+    return requireConfig(`Login completed but config file was not written (${configPath}).`);
   }
 
   console.log(`No login session found. Starting browser auth flow (config: ${configPath})...`);
-  await runLogin({ relayUrl, webUrl });
+  await runLogin(urls);
 
   return requireConfig(`Login completed but config file was not written (${configPath}).`);
 };
@@ -41,7 +82,8 @@ const startBridgeSession = async (config: CliConfig): Promise<void> => {
 };
 
 const loginAndConnect = async (): Promise<void> => {
-  await runLogin({ relayUrl, webUrl });
+  const urls = resolveDurangoUrls();
+  await runLogin(urls);
   const config = await requireConfig(`Login completed but config file was not written (${configPath}).`);
   await startBridgeSession(config);
 };
@@ -51,7 +93,7 @@ export const createProgram = (): Command => {
   program
     .name("durango")
     .description("Control local Codex agents from Durango web")
-    .version("0.1.0");
+    .version("0.1.2");
 
   program
     .command("login")
@@ -96,9 +138,28 @@ export const createProgram = (): Command => {
         return;
       }
 
+      const urls = resolveDurangoUrls();
+      if (config.relayUrl !== urls.relayUrl) {
+        console.log(
+          JSON.stringify(
+            {
+              error: "Stored Durango session targets a different relay. Run `durango login` for this environment.",
+              storedRelayUrl: config.relayUrl,
+              targetRelayUrl: urls.relayUrl,
+              configPath
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
+
+      const runtimeConfig = applyRuntimeUrls(config, urls);
+
       const status = await getJson<{ machineId: string; userId: string; online: boolean; lastHeartbeatAt: number | null }>(
-        `${config.relayUrl.replace(/\/$/, "")}/v1/machines/me/status`,
-        config.token
+        `${runtimeConfig.relayUrl.replace(/\/$/, "")}/v1/machines/me/status`,
+        runtimeConfig.token
       );
 
       console.log(JSON.stringify({ ...status, configPath }, null, 2));

@@ -61,6 +61,38 @@ export type RunState = {
   error?: ErrorEnvelope;
 };
 
+export type ReviewFinding = {
+  title: string;
+  body: string;
+  codeLocation: {
+    absoluteFilePath: string;
+    lineRange: {
+      start: number;
+      end: number;
+    };
+  };
+  confidenceScore: number;
+  priority: number;
+};
+
+export type ReviewTarget =
+  | {
+      type: "uncommittedChanges";
+    }
+  | {
+      type: "baseBranch";
+      branch: string;
+    };
+
+export type CollaborationMode =
+  | {
+      mode: "default" | "plan";
+      settings: {
+        model: string;
+        reasoningEffort?: ReasoningEffort;
+      };
+    };
+
 export type DurangoThreadItem =
   | {
       type: "userMessage";
@@ -108,6 +140,23 @@ export type DurangoThreadItem =
       turnId: string;
       text: string;
       timestamp: number;
+    }
+  | {
+      type: "enteredReviewMode";
+      id: string;
+      turnId: string;
+      text: string;
+      timestamp: number;
+    }
+  | {
+      type: "reviewResult";
+      id: string;
+      turnId: string;
+      summary: string;
+      overallCorrectness?: string;
+      overallConfidenceScore?: number;
+      findings: ReviewFinding[];
+      timestamp: number;
     };
 
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -131,10 +180,11 @@ export type DispatchAction =
       cwd: string;
       model?: string;
       reasoningEffort?: ReasoningEffort;
+      collaborationMode?: CollaborationMode;
       attachments?: DispatchAttachment[];
       approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
       sandbox?: "read-only" | "workspace-write" | "danger-full-access";
-      prompt: string;
+      prompt?: string;
     }
   | {
       type: "thread.fork";
@@ -164,9 +214,30 @@ export type DispatchAction =
       prompt: string;
       model?: string;
       reasoningEffort?: ReasoningEffort;
+      collaborationMode?: CollaborationMode;
       attachments?: DispatchAttachment[];
       approvalPolicy?: "untrusted" | "on-failure" | "on-request" | "never";
       sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+    }
+  | {
+      type: "review.start";
+      requestId: string;
+      userId: string;
+      machineId: string;
+      threadId: string;
+      codexThreadId: string;
+      projectId: string;
+      cwd: string;
+      target: ReviewTarget;
+      delivery: "detached";
+    }
+  | {
+      type: "project.branches.list";
+      requestId: string;
+      userId: string;
+      machineId: string;
+      projectId: string;
+      cwd: string;
     }
   | {
       type: "model.list";

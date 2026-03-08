@@ -27,3 +27,10 @@ bun install
 bun run build
 bun run test
 ```
+
+When you run the CLI from this source checkout, it now defaults to the local Durango stack:
+
+- relay: `http://localhost:8788`
+- web: `http://localhost:3000`
+
+If the stored CLI session was linked against a different relay, the CLI will ask you to log in again for the current target instead of silently connecting to the wrong environment.

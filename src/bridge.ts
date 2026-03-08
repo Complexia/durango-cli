@@ -6,6 +6,7 @@ import WebSocket from "ws";
 import type { DispatchAction, DurangoThreadItem, RelayClientMessage, RelayServerMessage } from "./protocol.js";
 import { CodexAppServerClient, type CodexTurnInputItem } from "./codex-adapter.js";
 import type { CliConfig } from "./config.js";
+import { listGitBranches, readGitMeta } from "./git.js";
 import { postJson } from "./http.js";
 import { loadProjectsForMachine, type ProjectRegistration } from "./projects.js";
 
@@ -19,6 +20,14 @@ const relayWsUrl = (relayUrl: string): string => {
 type PendingRun = {
   requestId: string;
   threadId: string;
+};
+
+type PendingTurnStartAction = Extract<DispatchAction, { type: "thread.start" | "turn.start" }>;
+
+type PendingTurnStartAck = {
+  action: PendingTurnStartAction;
+  codexThreadId: string;
+  payload: Record<string, unknown>;
 };
 
 type DispatchAttachment = NonNullable<Extract<DispatchAction, { type: "turn.start" }>["attachments"]>[number];
@@ -44,6 +53,9 @@ export class DurangoBridge {
   private connectPromise: Promise<void> | null = null;
   private readonly pending = new Map<string, PendingRun>();
   private readonly threadBindings = new Map<string, string>();
+  private readonly reviewThreadIds = new Set<string>();
+  private readonly activeTurnIds = new Map<string, string>();
+  private readonly pendingTurnStartAcks = new Map<string, PendingTurnStartAck>();
   private lastProjectSyncFingerprint: string | null = null;
   private reconnectAttempt = 0;
   private awaitingRelayPong = false;
@@ -156,7 +168,7 @@ export class DurangoBridge {
           platform: os.platform(),
           arch: os.arch(),
           osVersion: os.release(),
-          cliVersion: "0.1.0",
+          cliVersion: "0.1.2",
           codexVersion: process.env.CODEX_VERSION ?? "unknown"
         }
       };
@@ -368,7 +380,7 @@ export class DurangoBridge {
   }
 
   private async syncProjectsAndThreads(options?: { force?: boolean }): Promise<ProjectRegistration[]> {
-    const projects = await loadProjectsForMachine(this.config.machineId);
+    const projects = await this.loadProjectsWithGitMeta();
     const nextFingerprint = this.buildProjectSyncFingerprint(projects);
     if (!options?.force && nextFingerprint === this.lastProjectSyncFingerprint) {
       return projects;
@@ -378,6 +390,20 @@ export class DurangoBridge {
     await this.syncThreads(syncedProjects);
     this.lastProjectSyncFingerprint = nextFingerprint;
     return syncedProjects;
+  }
+
+  private async loadProjectsWithGitMeta(): Promise<ProjectRegistration[]> {
+    const projects = await loadProjectsForMachine(this.config.machineId);
+    return Promise.all(
+      projects.map(async (project) => {
+        const git = await readGitMeta(project.absolutePath);
+        return {
+          ...project,
+          gitBranch: git.branch ?? project.gitBranch,
+          gitRemoteUrl: git.remoteUrl ?? project.gitRemoteUrl
+        };
+      })
+    );
   }
 
   private async syncProjects(projects: ProjectRegistration[]): Promise<ProjectRegistration[]> {
@@ -577,12 +603,12 @@ export class DurangoBridge {
   }
 
   private async buildTurnInput(args: {
-    prompt: string;
+    prompt?: string;
     requestId: string;
     cwd?: string;
     attachments?: DispatchAttachment[];
   }): Promise<CodexTurnInputItem[]> {
-    const prompt = args.prompt.trim();
+    const prompt = args.prompt?.trim() ?? "";
     const input: CodexTurnInputItem[] = prompt
       ? [
           {
@@ -618,33 +644,58 @@ export class DurangoBridge {
           approvalPolicy: action.approvalPolicy,
           sandbox: action.sandbox
         });
-
-        const input = await this.buildTurnInput({
-          prompt: action.prompt,
-          requestId: action.requestId,
-          cwd: action.cwd,
-          attachments: action.attachments
-        });
-
-        await this.codex.turnStart({
-          codexThreadId: thread.thread.id,
-          input,
-          model: action.model,
-          reasoningEffort: action.reasoningEffort,
-          approvalPolicy: action.approvalPolicy,
-          sandbox: action.sandbox
-        });
-
         this.pending.set(action.requestId, {
           requestId: action.requestId,
           threadId: action.requestId
         });
         this.threadBindings.set(thread.thread.id, action.requestId);
 
-        await this.ack(action, "completed", {
-          codexThreadId: thread.thread.id,
-          state: "started"
-        });
+        const hasInitialTurn = Boolean(action.prompt?.trim()) || Boolean(action.attachments?.length);
+        let startedTurnId: string | undefined;
+        if (hasInitialTurn) {
+          this.pendingTurnStartAcks.set(thread.thread.id, {
+            action,
+            codexThreadId: thread.thread.id,
+            payload: {
+              codexThreadId: thread.thread.id,
+              state: "started"
+            }
+          });
+          const input = await this.buildTurnInput({
+            prompt: action.prompt,
+            requestId: action.requestId,
+            cwd: action.cwd,
+            attachments: action.attachments
+          });
+
+          const turn = await this.codex.turnStart({
+            codexThreadId: thread.thread.id,
+            input,
+            model: action.model,
+            reasoningEffort: action.reasoningEffort,
+            collaborationMode: action.collaborationMode,
+            approvalPolicy: action.approvalPolicy,
+            sandbox: action.sandbox
+          });
+          startedTurnId = turn.turn.id;
+          this.activeTurnIds.set(thread.thread.id, startedTurnId);
+          await this.completePendingTurnStartAck(thread.thread.id, startedTurnId);
+        }
+
+        if (!hasInitialTurn) {
+          await this.ack(action, "completed", {
+            codexThreadId: thread.thread.id,
+            state: "started",
+            turnId: startedTurnId
+          });
+        } else if (this.pendingTurnStartAcks.has(thread.thread.id)) {
+          this.pendingTurnStartAcks.delete(thread.thread.id);
+          await this.ack(action, "completed", {
+            codexThreadId: thread.thread.id,
+            state: "started",
+            turnId: startedTurnId
+          });
+        }
         return;
       }
 
@@ -675,21 +726,66 @@ export class DurangoBridge {
       if (action.type === "turn.start") {
         await this.ack(action, "running");
         this.threadBindings.set(action.codexThreadId, action.threadId);
+        this.pendingTurnStartAcks.set(action.codexThreadId, {
+          action,
+          codexThreadId: action.codexThreadId,
+          payload: {
+            state: "started"
+          }
+        });
         const input = await this.buildTurnInput({
           prompt: action.prompt,
           requestId: action.requestId,
           cwd: action.cwd,
           attachments: action.attachments
         });
-        await this.codex.turnStart({
+        const turn = await this.codex.turnStart({
           codexThreadId: action.codexThreadId,
           input,
           model: action.model,
           reasoningEffort: action.reasoningEffort,
+          collaborationMode: action.collaborationMode,
           approvalPolicy: action.approvalPolicy,
           sandbox: action.sandbox
         });
-        await this.ack(action, "completed", { state: "started" });
+        this.activeTurnIds.set(action.codexThreadId, turn.turn.id);
+        await this.completePendingTurnStartAck(action.codexThreadId, turn.turn.id);
+        if (this.pendingTurnStartAcks.has(action.codexThreadId)) {
+          this.pendingTurnStartAcks.delete(action.codexThreadId);
+          await this.ack(action, "completed", { state: "started", turnId: turn.turn.id });
+        }
+        return;
+      }
+
+      if (action.type === "review.start") {
+        await this.ack(action, "running");
+        this.threadBindings.set(action.codexThreadId, action.threadId);
+        const review = await this.codex.reviewStart({
+          codexThreadId: action.codexThreadId,
+          target: action.target,
+          delivery: action.delivery
+        });
+        const durangoReviewThreadId = this.makeDurangoThreadId(review.reviewThreadId);
+        this.threadBindings.set(review.reviewThreadId, durangoReviewThreadId);
+        this.reviewThreadIds.add(review.reviewThreadId);
+        await this.ack(action, "completed", {
+          state: "started",
+          reviewThreadId: review.reviewThreadId,
+          turnId: review.turn.id
+        });
+        return;
+      }
+
+      if (action.type === "project.branches.list") {
+        await this.ack(action, "running");
+        const [branches, git] = await Promise.all([
+          listGitBranches(action.cwd),
+          readGitMeta(action.cwd)
+        ]);
+        await this.ack(action, "completed", {
+          branches,
+          currentBranch: git.branch ?? null
+        });
         return;
       }
 
@@ -706,6 +802,16 @@ export class DurangoBridge {
         await this.ack(action, "completed", { state: "interrupted" });
       }
     } catch (error) {
+      if (action.type === "thread.start" || action.type === "turn.start") {
+        const codexThreadId =
+          action.type === "thread.start"
+            ? Array.from(this.pendingTurnStartAcks.values()).find((entry) => entry.action.requestId === action.requestId)
+                ?.codexThreadId ?? null
+            : action.codexThreadId;
+        if (codexThreadId) {
+          this.pendingTurnStartAcks.delete(codexThreadId);
+        }
+      }
       await this.ack(action, "failed", undefined, {
         code: "APP_SERVER_ERROR",
         message: error instanceof Error ? error.message : "Unknown app-server error"
@@ -728,6 +834,7 @@ export class DurangoBridge {
       const rawItems = this.extractItemsFromTurn(turn);
       let importedTurnItemCount = 0;
       let hasRunningActivity = false;
+      const allowReviewItems = this.reviewThreadIds.has(codexThreadId);
 
       for (const rawItem of rawItems) {
         const item = this.asObject(rawItem);
@@ -755,7 +862,7 @@ export class DurangoBridge {
           continue;
         }
 
-        const mappedItems = this.mapCodexItem(item, turnId, timestamp++);
+        const mappedItems = this.mapCodexItem(item, turnId, timestamp++, { allowReviewItems });
         if (mappedItems.length === 0) {
           continue;
         }
@@ -783,12 +890,12 @@ export class DurangoBridge {
           requestId: turnId,
           machineId: this.config.machineId,
           threadId,
-          item: {
-            type: "plan",
-            id: randomUUID(),
-            turnId,
-            text: JSON.stringify({
-              method: "turn/completed",
+            item: {
+              type: "plan",
+              id: `turn-completed:${turnId}`,
+              turnId,
+              text: JSON.stringify({
+                method: "turn/completed",
               params: { status: turnLifecycleStatus }
             }),
             timestamp: timestamp++
@@ -960,6 +1067,75 @@ export class DurangoBridge {
     return [];
   }
 
+  private mapReviewResult(
+    input: {
+      id?: string;
+      turnId: string;
+      timestamp?: number;
+      summary?: string;
+      reviewOutput?: unknown;
+    }
+  ): DurangoThreadItem | null {
+    const reviewOutput = this.asObject(input.reviewOutput);
+    const findings = Array.isArray(reviewOutput?.findings)
+      ? reviewOutput.findings
+          .map((entry) => {
+            const finding = this.asObject(entry);
+            const codeLocation = this.asObject(finding?.code_location ?? finding?.codeLocation);
+            const lineRange = this.asObject(codeLocation?.line_range ?? codeLocation?.lineRange);
+            const absoluteFilePath = this.getString(
+              codeLocation?.absolute_file_path ?? codeLocation?.absoluteFilePath
+            );
+            const title = this.getString(finding?.title);
+            const body = this.getString(finding?.body);
+            const start = this.getNumber(lineRange?.start);
+            const end = this.getNumber(lineRange?.end);
+
+            if (!title || !body || !absoluteFilePath || start === null || end === null) {
+              return null;
+            }
+
+            return {
+              title,
+              body,
+              codeLocation: {
+                absoluteFilePath,
+                lineRange: {
+                  start,
+                  end
+                }
+              },
+              confidenceScore:
+                this.getNumber(finding?.confidence_score ?? finding?.confidenceScore) ?? 0,
+              priority: this.getNumber(finding?.priority) ?? 0
+            };
+          })
+          .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+      : [];
+
+    const summary =
+      input.summary?.trim() ||
+      this.getString(reviewOutput?.overall_explanation ?? reviewOutput?.overallExplanation)?.trim() ||
+      "Code review completed.";
+
+    if (!summary && findings.length === 0) {
+      return null;
+    }
+
+    return {
+      type: "reviewResult",
+      id: input.id ?? `review:${input.turnId}`,
+      turnId: input.turnId,
+      summary,
+      overallCorrectness:
+        this.getString(reviewOutput?.overall_correctness ?? reviewOutput?.overallCorrectness) ?? undefined,
+      overallConfidenceScore:
+        this.getNumber(reviewOutput?.overall_confidence_score ?? reviewOutput?.overallConfidenceScore) ?? undefined,
+      findings,
+      timestamp: input.timestamp ?? Date.now()
+    };
+  }
+
   private forwardCodexNotification(method: string, params: unknown): void {
     const lowerMethod = method.toLowerCase();
     const codexThreadId = this.extractThreadId(params);
@@ -990,9 +1166,20 @@ export class DurangoBridge {
       return;
     }
 
-    const turnId = this.extractTurnId(params) ?? randomUUID();
+    const extractedTurnId = this.extractTurnId(params);
+    const mappedTurnId = this.activeTurnIds.get(codexThreadId);
+    const turnId =
+      lowerMethod === "turn/completed"
+        ? mappedTurnId ?? extractedTurnId ?? randomUUID()
+        : extractedTurnId ?? mappedTurnId ?? randomUUID();
+    if (extractedTurnId && lowerMethod !== "turn/completed" && this.shouldTrackActiveTurnId(extractedTurnId)) {
+      this.activeTurnIds.set(codexThreadId, extractedTurnId);
+      void this.completePendingTurnStartAck(codexThreadId, extractedTurnId);
+    }
     const envelope = this.asObject(params);
     const rawItem = this.asObject(envelope?.item);
+    const rawReviewOutput = envelope?.review_output ?? envelope?.reviewOutput;
+    const isReviewThread = this.reviewThreadIds.has(codexThreadId);
 
     let items: DurangoThreadItem[] = [];
 
@@ -1004,27 +1191,53 @@ export class DurangoBridge {
       const type = this.getString(rawItem.type)?.toLowerCase() ?? "";
       // Emit only live command activity on start; message/reasoning content is emitted on completion.
       if (type === "commandexecution" || type === "command_execution") {
-        items = this.mapCodexItem(rawItem, turnId);
+        items = this.mapCodexItem(rawItem, turnId, Date.now(), { allowReviewItems: isReviewThread });
       } else {
         return;
       }
     } else if (lowerMethod === "item/completed") {
       if (rawItem) {
-        items = this.mapCodexItem(rawItem, turnId);
+        items = this.mapCodexItem(rawItem, turnId, Date.now(), { allowReviewItems: isReviewThread });
+      } else if (isReviewThread) {
+        const structuredReview = this.mapReviewResult({
+          id: `review:${turnId}`,
+          turnId,
+          reviewOutput: rawReviewOutput,
+          timestamp: Date.now()
+        });
+        if (structuredReview) {
+          items = [structuredReview];
+        }
       }
     } else if (lowerMethod === "turn/completed") {
       const status = this.getString(envelope?.status)?.toLowerCase() ?? "completed";
       const errorMessage = this.getString(this.asObject(envelope?.error)?.message);
-      if (status !== "completed" && status !== "success") {
-        items = [
-          {
-            type: "plan",
-            id: randomUUID(),
-            turnId,
-            text: `Turn ended with status "${status}"${errorMessage ? `: ${errorMessage}` : ""}.`,
-            timestamp: Date.now()
-          }
-        ];
+      items = [
+        {
+          type: "plan",
+          id: `turn-completed:${turnId}`,
+          turnId,
+          text: JSON.stringify({
+            method: "turn/completed",
+            params: {
+              status,
+              ...(errorMessage ? { error: { message: errorMessage } } : {})
+            }
+          }),
+          timestamp: Date.now()
+        }
+      ];
+
+      if (isReviewThread) {
+        const structuredReview = this.mapReviewResult({
+          id: `review:${turnId}`,
+          turnId,
+          reviewOutput: rawReviewOutput,
+          timestamp: Date.now()
+        });
+        if (structuredReview) {
+          items.push(structuredReview);
+        }
       }
     } else if (
       lowerMethod === "thread/started" ||
@@ -1033,6 +1246,11 @@ export class DurangoBridge {
       lowerMethod.includes("updated")
     ) {
       return;
+    }
+
+    if (lowerMethod === "turn/completed") {
+      this.activeTurnIds.delete(codexThreadId);
+      this.pendingTurnStartAcks.delete(codexThreadId);
     }
 
     if (items.length === 0) {
@@ -1266,9 +1484,24 @@ export class DurangoBridge {
     return "failed";
   }
 
-  private mapCodexItem(item: Record<string, unknown>, turnId: string, timestamp = Date.now()): DurangoThreadItem[] {
+  private shouldTrackActiveTurnId(turnId: string): boolean {
+    const normalized = turnId.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    return !normalized.startsWith("auto-compact-");
+  }
+
+  private mapCodexItem(
+    item: Record<string, unknown>,
+    turnId: string,
+    timestamp = Date.now(),
+    options?: { allowReviewItems?: boolean }
+  ): DurangoThreadItem[] {
     const type = this.getString(item.type)?.toLowerCase() ?? "";
     const id = this.getString(item.id) ?? randomUUID();
+    const allowReviewItems = options?.allowReviewItems ?? false;
 
     if (type === "usermessage" || type === "user_message") {
       const text = this.extractText(item.content ?? item.text).trim();
@@ -1357,8 +1590,43 @@ export class DurangoBridge {
       return [{ type: "plan", id, turnId, text, timestamp }];
     }
 
+    if (type === "enteredreviewmode" || type === "entered_review_mode") {
+      if (!allowReviewItems) {
+        return [];
+      }
+      const text = this.extractText(item.review ?? item.text ?? item.content).trim() || "Code review started.";
+      return [{ type: "enteredReviewMode", id, turnId, text, timestamp }];
+    }
+
+    if (type === "exitedreviewmode" || type === "exited_review_mode") {
+      if (!allowReviewItems) {
+        return [];
+      }
+      const reviewResult = this.mapReviewResult({
+        id: `review:${turnId}`,
+        turnId,
+        timestamp,
+        summary: this.extractText(item.text ?? item.content).trim(),
+        reviewOutput: item.review
+      });
+      return reviewResult ? [reviewResult] : [];
+    }
+
     const fallbackText = JSON.stringify(item);
     return [{ type: "plan", id, turnId, text: fallbackText, timestamp }];
+  }
+
+  private async completePendingTurnStartAck(codexThreadId: string, turnId: string): Promise<void> {
+    const pendingAck = this.pendingTurnStartAcks.get(codexThreadId);
+    if (!pendingAck) {
+      return;
+    }
+
+    this.pendingTurnStartAcks.delete(codexThreadId);
+    await this.ack(pendingAck.action, "completed", {
+      ...pendingAck.payload,
+      turnId
+    });
   }
 
   async stop(): Promise<void> {
