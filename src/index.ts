@@ -3,7 +3,7 @@ import "dotenv/config";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { clearConfig, configPath, ensureMachineId, readConfig, type CliConfig } from "./config.js";
 import { runLogin } from "./login.js";
@@ -93,7 +93,7 @@ export const createProgram = (): Command => {
   program
     .name("durango")
     .description("Control local Codex agents from Durango web")
-    .version("0.1.3");
+    .version("0.1.5");
 
   program
     .command("login")
@@ -215,11 +215,7 @@ export const main = async (argv: string[] = process.argv): Promise<void> => {
   await program.parseAsync(argv);
 };
 
-const isDirectRun = process.argv[1] ? pathToFileURL(process.argv[1]).href === import.meta.url : false;
-
-if (isDirectRun) {
-  main().catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
-}
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

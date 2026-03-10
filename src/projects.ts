@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { configDir } from "./config.js";
 
@@ -138,6 +138,43 @@ export const saveProjectRegistration = async (input: {
     gitBranch: project.project.gitBranch,
     gitRemoteUrl: project.project.gitRemoteUrl
   };
+};
+
+export const removeProjectRegistration = async (input: {
+  absolutePath: string;
+  projectId?: string;
+  machineId?: string;
+}): Promise<boolean> => {
+  const absolutePath = path.resolve(input.absolutePath);
+  const filePath = projectFilePath(absolutePath);
+  const existing = await readLocalProjectFile(absolutePath);
+
+  if (existing) {
+    if (input.projectId && existing.project.id !== input.projectId) {
+      throw new Error(`Refusing to remove project registration for ${absolutePath}: project id does not match.`);
+    }
+
+    if (input.machineId && existing.project.machineId !== input.machineId) {
+      throw new Error(`Refusing to remove project registration for ${absolutePath}: machine id does not match.`);
+    }
+  }
+
+  const registry = await readProjectRegistry();
+  const nextRegistry = registry.filter((entry) => entry !== filePath);
+  if (nextRegistry.length !== registry.length) {
+    await writeProjectRegistry(nextRegistry);
+  }
+
+  try {
+    await unlink(filePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  return Boolean(existing) || nextRegistry.length !== registry.length;
 };
 
 export const loadProjectsForMachine = async (machineId: string): Promise<ProjectRegistration[]> => {

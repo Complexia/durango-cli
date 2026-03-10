@@ -243,7 +243,7 @@ export const runLogin = async (opts: LoginOptions): Promise<void> => {
       platform: os.platform(),
       arch: os.arch(),
       osVersion: os.release(),
-      cliVersion: "0.1.3"
+      cliVersion: "0.1.4"
     }
   });
 

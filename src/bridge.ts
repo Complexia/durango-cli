@@ -8,7 +8,7 @@ import { CodexAppServerClient, type CodexTurnInputItem } from "./codex-adapter.j
 import type { CliConfig } from "./config.js";
 import { listGitBranches, readGitMeta } from "./git.js";
 import { postJson } from "./http.js";
-import { loadProjectsForMachine, type ProjectRegistration } from "./projects.js";
+import { loadProjectsForMachine, removeProjectRegistration, type ProjectRegistration } from "./projects.js";
 
 const relayWsUrl = (relayUrl: string): string => {
   const url = new URL(relayUrl);
@@ -170,7 +170,7 @@ export class DurangoBridge {
           platform: os.platform(),
           arch: os.arch(),
           osVersion: os.release(),
-          cliVersion: "0.1.3",
+          cliVersion: "0.1.4",
           codexVersion: process.env.CODEX_VERSION ?? "unknown"
         }
       };
@@ -790,6 +790,17 @@ export class DurangoBridge {
           branches,
           currentBranch: git.branch ?? null
         });
+        return;
+      }
+
+      if (action.type === "project.unregister") {
+        await this.ack(action, "running");
+        await removeProjectRegistration({
+          absolutePath: action.cwd,
+          projectId: action.projectId,
+          machineId: action.machineId
+        });
+        await this.ack(action, "completed", { state: "unregistered" });
         return;
       }
 

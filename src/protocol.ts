@@ -240,6 +240,14 @@ export type DispatchAction =
       cwd: string;
     }
   | {
+      type: "project.unregister";
+      requestId: string;
+      userId: string;
+      machineId: string;
+      projectId: string;
+      cwd: string;
+    }
+  | {
       type: "model.list";
       requestId: string;
       userId: string;

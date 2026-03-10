@@ -82,4 +82,43 @@ describe("project persistence", () => {
     const compactedRegistry = JSON.parse(await readFile(registryPath, "utf8")) as string[];
     expect(compactedRegistry).toEqual([path.join(testProjectDir, ".durango", "project.json")]);
   });
+
+  it("removes local manifest and registry entry when unregistering a project", async () => {
+    const { removeProjectRegistration, saveProjectRegistration } = await import("./projects.js");
+    const saved = await saveProjectRegistration({
+      absolutePath: testProjectDir,
+      machineId: "machine-a"
+    });
+
+    const removed = await removeProjectRegistration({
+      absolutePath: testProjectDir,
+      projectId: saved.id,
+      machineId: "machine-a"
+    });
+
+    expect(removed).toBe(true);
+
+    const manifestPath = path.join(testProjectDir, ".durango", "project.json");
+    await expect(readFile(manifestPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    const registryPath = path.join(testConfigDir, "projects.json");
+    const registry = JSON.parse(await readFile(registryPath, "utf8")) as string[];
+    expect(registry).toEqual([]);
+  });
+
+  it("refuses to unregister a different project at the same path", async () => {
+    const { removeProjectRegistration, saveProjectRegistration } = await import("./projects.js");
+    await saveProjectRegistration({
+      absolutePath: testProjectDir,
+      machineId: "machine-a"
+    });
+
+    await expect(
+      removeProjectRegistration({
+        absolutePath: testProjectDir,
+        projectId: "different-project-id",
+        machineId: "machine-a"
+      })
+    ).rejects.toThrow("project id does not match");
+  });
 });
