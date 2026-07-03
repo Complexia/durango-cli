@@ -1,13 +1,21 @@
 {
   "name": "durango-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Command-line client for the Durango API.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "durango": "./src/index.ts"
+    "durango": "dist/index.js",
+    "durango-cli": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
     "start": "bun run src/index.ts"
   },
