@@ -2,7 +2,8 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { arch, hostname, homedir, platform, release } from "node:os";
+import { spawn } from "node:child_process";
 
 type JsonObject = Record<string, unknown>;
 type ParsedArgs = {
@@ -135,6 +136,25 @@ async function apiJson(path: string, init: RequestInit = {}) {
   return await response.json() as JsonObject;
 }
 
+async function publicJson(path: string, init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  if (init.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(`${getBaseUrl()}${path}`, { ...init, headers });
+  if (!response.ok) {
+    const body = await response.json().catch(async () => ({ error: await response.text() }));
+    const message = typeof body?.error === "string"
+      ? body.error
+      : typeof body?.error?.message === "string"
+        ? body.error.message
+        : `${response.status} ${response.statusText}`;
+    throw new CliError(message, response.status >= 500 ? 2 : 1);
+  }
+  return await response.json() as JsonObject;
+}
+
 async function apiDownload(urlOrPath: string) {
   const url = urlOrPath.startsWith("http://") || urlOrPath.startsWith("https://")
     ? urlOrPath
@@ -192,6 +212,103 @@ async function commandConfig(args: ParsedArgs) {
   if (baseUrl) config.baseUrl = baseUrl.replace(/\/+$/, "");
   writeConfig(config);
   process.stdout.write(`Saved ${CONFIG_PATH}\n`);
+}
+
+function openBrowser(url: string) {
+  const command = process.platform === "darwin"
+    ? "open"
+    : process.platform === "win32"
+      ? "cmd"
+      : "xdg-open";
+  const commandArgs = process.platform === "win32"
+    ? ["/c", "start", "", url]
+    : [url];
+
+  const child = spawn(command, commandArgs, {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+}
+
+async function commandLogin(args: ParsedArgs) {
+  const baseUrl = optionString(args.options, "base-url");
+  if (baseUrl) {
+    const config = readConfig();
+    config.baseUrl = baseUrl.replace(/\/+$/, "");
+    writeConfig(config);
+  }
+
+  const started = await publicJson("/api/cli/auth/start", {
+    method: "POST",
+    body: JSON.stringify({
+      hostname: hostname(),
+      machine_name: hostname(),
+      platform: platform(),
+      arch: arch(),
+      os_version: release(),
+      cli_version: "0.3.0",
+    }),
+  });
+
+  const authorizeUrl = String(started.authorize_url || "");
+  const attemptId = String(started.attempt_id || "");
+  const pollToken = String(started.poll_token || "");
+  const code = String(started.code || "");
+  const intervalSeconds = Number(started.interval || 2);
+  const expiresAt = Number(started.expires_at || Date.now() + 10 * 60 * 1000);
+
+  if (!authorizeUrl || !attemptId || !pollToken) {
+    throw new CliError("Durango did not return a valid login attempt.");
+  }
+
+  process.stdout.write(`Opening browser for Durango login...\n\n`);
+  process.stdout.write(`Verification code: ${code}\n`);
+  process.stdout.write(`Login URL: ${authorizeUrl}\n\n`);
+  openBrowser(authorizeUrl);
+
+  while (Date.now() < expiresAt) {
+    await new Promise((resolve) => setTimeout(resolve, intervalSeconds * 1000));
+    const status = await publicJson("/api/cli/auth/status", {
+      method: "POST",
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        poll_token: pollToken,
+      }),
+    });
+
+    if (status.status === "authorized") {
+      const completed = await publicJson("/api/cli/auth/complete", {
+        method: "POST",
+        body: JSON.stringify({
+          attempt_id: attemptId,
+          poll_token: pollToken,
+        }),
+      });
+      const apiKey = String(completed.api_key || "");
+      if (!apiKey) {
+        throw new CliError("Durango did not return an API key.");
+      }
+      const config = readConfig();
+      config.apiKey = apiKey;
+      if (baseUrl) config.baseUrl = baseUrl.replace(/\/+$/, "");
+      writeConfig(config);
+      const user = completed.user && typeof completed.user === "object" ? completed.user as JsonObject : {};
+      const label = typeof user.email === "string" && user.email ? ` as ${user.email}` : "";
+      process.stdout.write(`Signed in${label}. Saved credentials to ${CONFIG_PATH}\n`);
+      return;
+    }
+
+    if (status.status === "completed") {
+      throw new CliError("This login attempt was already completed. Run durango login again.");
+    }
+
+    if (status.status === "expired" || status.status === "cancelled") {
+      throw new CliError("Durango login expired. Run durango login again.");
+    }
+  }
+
+  throw new CliError("Durango login timed out. Run durango login again.");
 }
 
 async function commandCredits() {
@@ -359,6 +476,7 @@ function help() {
 
 Usage:
   durango config set [--api-key dgo_...] [--base-url https://heydurango.com]
+  durango login [--base-url https://heydurango.com]
   durango credits
   durango models list [--type chat|image|video]
   durango image generate --model <id> --prompt <text> [--out image.png]
@@ -382,6 +500,7 @@ async function main() {
   }
 
   if (command === "config") return await commandConfig(args);
+  if (command === "login") return await commandLogin(args);
   if (command === "credits") return await commandCredits();
   if (command === "models") return await commandModels(args);
   if (command === "image") return await commandImage(args);

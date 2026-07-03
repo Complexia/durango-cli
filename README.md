@@ -19,6 +19,14 @@ export DURANGO_BASE_URL="https://heydurango.com"
 Or persist local config:
 
 ```bash
+durango login
+```
+
+That opens Durango in your browser, signs in with your Durango account, and saves a CLI API key locally.
+
+You can also configure an API key manually:
+
+```bash
 durango config set --api-key dgo_... --base-url https://heydurango.com
 ```
 
