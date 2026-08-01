@@ -1,7 +1,7 @@
 {
   "name": "durango-cli",
-  "version": "0.3.0",
-  "description": "Command-line client for the Durango API.",
+  "version": "0.4.0",
+  "description": "Command-line client for the Durango API: chat models, image generation, video generation, and prompt-driven video editing.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -11,12 +11,14 @@
   "files": [
     "dist",
     "README.md",
+    "AGENTS.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
+    "test": "bun test",
     "start": "bun run src/index.ts"
   },
   "engines": {
